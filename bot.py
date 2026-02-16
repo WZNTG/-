@@ -19,7 +19,7 @@ CHANNEL_TAG = "@chaihanabotprom"
 DB_NAME = "chaihana_v2.db"
 
 # Текстовые константы
-AD_TEXT = f"\n\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n📢 <b>Инфо и промокоды доза пиписьки:</b> {CHANNEL_TAG}"
+AD_TEXT = f"\n\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n📢 <b>Инфо и промокоды:</b> {CHANNEL_TAG}"
 
 # Логирование
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -98,36 +98,17 @@ async def get_rank(user_id):
     return res['cnt'] + 1
 
 async def crypto_updater():
-    """Фоновая задача для обновления курса с реалистичной волатильностью"""
+    """Фоновая задача для обновления курса"""
     global CRYPTO_PRICE
     while True:
-        # Генерируем случайное число для определения события на рынке
-        event = random.random()
-        
-        if event < 0.10:  # 10% шанс на КРАХ (Дамп)
-            change_percent = random.uniform(-0.40, -0.15) # Падение от 15% до 40%
-        elif event < 0.45:  # 35% шанс на обычное падение
-            change_percent = random.uniform(-0.07, -0.01) # Падение от 1% до 7%
-        elif event < 0.85:  # 40% шанс на умеренный рост
-            change_percent = random.uniform(0.01, 0.08)  # Рост от 1% до 8%
-        else:  # 15% шанс на ТУЗЕМУН (Памп)
-            change_percent = random.uniform(0.20, 0.60)  # Взлет от 20% до 60%
+        change = random.randint(-50, 100)
+        CRYPTO_PRICE += change
+        if CRYPTO_PRICE < 10: CRYPTO_PRICE = 10
+        if CRYPTO_PRICE > 10000: CRYPTO_PRICE = 9000
+        await asyncio.sleep(120)  # Обновление каждые 2 минуты
 
-        # Вычисляем новую цену
-        new_price = int(CRYPTO_PRICE * (1 + change_percent))
-        
-        # Устанавливаем границы, чтобы цена не ушла в ноль и не стала бесконечной
-        if new_price < 10: 
-            CRYPTO_PRICE = 10
-        elif new_price > 25000:
-            CRYPTO_PRICE = 20000
-        else:
-            CRYPTO_PRICE = new_price
-
-        # Логируем изменение в консоль (для админа)
-        logging.info(f"Обновление курса: {CRYPTO_PRICE} очков (изменение: {change_percent:.2%})")
-        
-        await asyncio.sleep(60)  # Обновляем раз в 5 минут (чтобы успевали торговать)
+def format_number(num):
+    return f"{num:,}".replace(",", ".")
 
 # 🎮 ОСНОВНЫЕ КОМАНДЫ
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
@@ -594,55 +575,33 @@ async def cmd_promo(message: types.Message, command: CommandObject):
     
     await message.answer(f"✅ <b>Промокод активирован!</b>\nНачислено: +{reward} очков.{AD_TEXT}", parse_mode="HTML")
 
-# 👑 АДМИНКА (Управление рынком и ресурсами)
+# 👑 АДМИНКА
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-
-@dp.message(Command("setrate"))
-async def adm_set_rate(message: types.Message, command: CommandObject):
-    """Принудительно установить курс: /setrate 500"""
-    if message.from_user.id != ADMIN_ID: 
-        return # Бот проигнорирует, если пишет не админ
-    
+@dp.message(Command("addpromo"))
+async def adm_addpromo(message: types.Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID: return
     try:
-        global CRYPTO_PRICE
-        new_price = int(command.args)
-        CRYPTO_PRICE = new_price
-        await message.answer(f"🛠 <b>Рынок под контролем:</b>\nКурс принудительно установлен на <b>{CRYPTO_PRICE}</b>")
+        args = command.args.split() # code min max
+        code = args[0]
+        min_v = int(args[1])
+        max_v = int(args[2])
+        await db.execute("INSERT OR REPLACE INTO promos (code, min_val, max_val) VALUES (?, ?, ?)", (code, min_v, max_v))
+        await message.answer(f"Admin: Promo {code} added ({min_v}-{max_v}).")
     except:
-        await message.answer("❌ Пиши: <code>/setrate 150</code>")
-
-@dp.message(Command("pump"))
-async def adm_pump(message: types.Message, command: CommandObject):
-    """Резкий рост или обвал: /pump 0.5 (рост 50%) или /pump -0.8 (обвал 80%)"""
-    if message.from_user.id != ADMIN_ID: 
-        return
-    
-    try:
-        global CRYPTO_PRICE
-        multiplier = float(command.args)
-        old_price = CRYPTO_PRICE
-        CRYPTO_PRICE = int(CRYPTO_PRICE * (1 + multiplier))
-        
-        # Защита от отрицательного курса
-        if CRYPTO_PRICE < 10: CRYPTO_PRICE = 10
-        
-        status = "🚀 ПАМП" if multiplier > 0 else "📉 ДАМП"
-        await message.answer(f"⚠️ <b>{status} УСТРОЕН!</b>\nСтарая цена: {old_price}\nНовая цена: <b>{CRYPTO_PRICE}</b>")
-    except:
-        await message.answer("❌ Примеры:\n<code>/pump 0.5</code> (+50%)\n<code>/pump -0.5</code> (-50%)")
+        await message.answer("Error. Use: /addpromo code min max")
 
 @dp.message(Command("admgive"))
 async def adm_give(message: types.Message, command: CommandObject):
-    """Выдать очки игроку: /admgive ID СУММА"""
     if message.from_user.id != ADMIN_ID: return
     try:
-        args = command.args.split()
+        args = command.args.split() # id amount
         uid = int(args[0])
         amt = int(args[1])
         await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amt, uid))
-        await message.answer(f"💎 <b>Админ:</b> Вы выдали <b>{amt}</b> очков пользователю <code>{uid}</code>")
+        await message.answer(f"Admin: Gave {amt} to {uid}")
     except:
-        await message.answer("❌ Ошибка. Используй: <code>/admgive ID СУММА</code>")
+        await message.answer("Error.")
+
 # 🚀 ЗАПУСК
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 async def main():
