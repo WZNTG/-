@@ -3,36 +3,56 @@ import logging
 import random
 import time
 import math
-from datetime import datetime, timedelta
 import aiosqlite
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.storage.memory import MemoryStorage
 
 # ⚙️ КОНФИГУРАЦИЯ
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-TOKEN = "8542233717:AAEfuFgvdkHLRDMshwzWq885r2dECOiYW0s"
+TOKEN = "8542233717:AAEfuFgvdkHLRDMshwzWq885r2dECOiYW0s"  # Убедитесь, что токен верный
 ADMIN_ID = 5394084759
 CHANNEL_TAG = "@chaihanabotprom"
-AD_TEXT = f"\n\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n📢 <b>Промокоды, информация и какой-то Даниил:</b> {CHANNEL_TAG}"
+DB_NAME = "chaihana_v2.db"
+
+# Текстовые константы
+AD_TEXT = f"\n\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n📢 <b>Инфо и промокоды:</b> {CHANNEL_TAG}"
 
 # Логирование
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# Инициализация бота
 bot = Bot(token=TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
-# Глобальные переменные
-DB_NAME = "chaihana.db"
-CRYPTO_PRICE = 100  # Начальная цена
-ACTIVE_DUELS = {}   # message_id: {data}
+# Глобальные переменные экономики
+CRYPTO_PRICE = 100
+LAST_CRYPTO_UPDATE = 0
 
-# 🛠 БАЗА ДАННЫХ
+# 🛠 МЕНЕДЖЕР БАЗЫ ДАННЫХ
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Таблица пользователей
-        await db.execute("""CREATE TABLE IF NOT EXISTS users (
+class Database:
+    def __init__(self, db_path):
+        self.db_path = db_path
+
+    async def execute(self, sql, params=(), fetch=None):
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(sql, params)
+            data = None
+            if fetch == "one":
+                data = await cursor.fetchone()
+            elif fetch == "all":
+                data = await cursor.fetchall()
+            await db.commit()
+            return data
+
+    async def init_tables(self):
+        await self.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             custom_name TEXT,
@@ -42,622 +62,561 @@ async def init_db():
             pig_lvl INTEGER DEFAULT 0,
             last_chaihana INTEGER DEFAULT 0,
             last_farm_monkey INTEGER DEFAULT 0,
-            last_farm_pig INTEGER DEFAULT 0
+            last_farm_pig INTEGER DEFAULT 0,
+            last_bonus INTEGER DEFAULT 0,
+            last_work INTEGER DEFAULT 0
         )""")
-        # Таблица промокодов
-        await db.execute("""CREATE TABLE IF NOT EXISTS promos (
+        await self.execute("""CREATE TABLE IF NOT EXISTS promos (
             code TEXT PRIMARY KEY,
             min_val INTEGER,
             max_val INTEGER,
-            is_random BOOLEAN
+            activations INTEGER DEFAULT 0
         )""")
-        # Таблица использованных промокодов
-        await db.execute("""CREATE TABLE IF NOT EXISTS used_promos (
+        await self.execute("""CREATE TABLE IF NOT EXISTS used_promos (
             user_id INTEGER,
             code TEXT,
             PRIMARY KEY (user_id, code)
         )""")
-        await db.commit()
+
+db = Database(DB_NAME)
 
 # 🛠 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 async def get_user(user_id, username=None):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            user = await cursor.fetchone()
-            if not user:
-                await db.execute("INSERT INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
-                await db.commit()
-                return await get_user(user_id, username)
-            return user
-
-async def update_balance(user_id, amount, currency="points"):
-    col = "points" if currency == "points" else "coins"
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(f"UPDATE users SET {col} = {col} + ? WHERE user_id = ?", (amount, user_id))
-        await db.commit()
-
-async def get_top_users(limit=10, global_top=True, chat_users=None):
-    async with aiosqlite.connect(DB_NAME) as db:
-        if global_top:
-            sql = "SELECT user_id, custom_name, username, points FROM users ORDER BY points DESC LIMIT ?"
-            params = (limit,)
-        else:
-            # Для топа чата нужен список ID участников, но бот не хранит всех юзеров чата по умолчанию.
-            # Мы будем фильтровать тех, кто есть в БД.
-            placeholders = ','.join('?' for _ in chat_users)
-            sql = f"SELECT user_id, custom_name, username, points FROM users WHERE user_id IN ({placeholders}) ORDER BY points DESC LIMIT ?"
-            params = (*chat_users, limit)
-        
-        async with db.execute(sql, params) as cursor:
-            return await cursor.fetchall()
+    user = await db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,), fetch="one")
+    if not user:
+        await db.execute("INSERT INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+        return await get_user(user_id, username)
+    
+    # Обновляем юзернейм если изменился
+    if username and user['username'] != username:
+         await db.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
+    return user
 
 async def get_rank(user_id):
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Узнаем место в мире
-        async with db.execute("SELECT COUNT(*) FROM users WHERE points > (SELECT points FROM users WHERE user_id = ?)", (user_id,)) as cursor:
-            rank = (await cursor.fetchone())[0] + 1
-        return rank
+    res = await db.execute("SELECT COUNT(*) as cnt FROM users WHERE points > (SELECT points FROM users WHERE user_id = ?)", (user_id,), fetch="one")
+    return res['cnt'] + 1
 
-# 📈 ФОНОВАЯ ЗАДАЧА: КУРС КРИПТЫ
-# ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 async def crypto_updater():
+    """Фоновая задача для обновления курса"""
     global CRYPTO_PRICE
     while True:
-        # Рандом от 1 до 5000
-        CRYPTO_PRICE = random.randint(1, 5000)
-        # Каждые 1.3 минуты = 78 секунд
-        await asyncio.sleep(78)
+        change = random.randint(-50, 100)
+        CRYPTO_PRICE += change
+        if CRYPTO_PRICE < 10: CRYPTO_PRICE = 10
+        if CRYPTO_PRICE > 10000: CRYPTO_PRICE = 9000
+        await asyncio.sleep(120)  # Обновление каждые 2 минуты
 
-# 🎮 КОМАНДЫ ПОЛЬЗОВАТЕЛЯ
+def format_number(num):
+    return f"{num:,}".replace(",", ".")
+
+# 🎮 ОСНОВНЫЕ КОМАНДЫ
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 
-# /chaihana
-@dp.message(F.text.lower().in_({"чайхана", "/chaihana"}))
+@dp.message(Command("start", "help", "помощь"))
+async def cmd_start(message: types.Message):
+    await get_user(message.from_user.id, message.from_user.username)
+    text = (
+        "🤖 <b>Чайхана Бот v3.0 (Fixed & Upgraded)</b>\n"
+        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+        "☕ <code>/chaihana</code> — Пить чай (репутация)\n"
+        "💼 <code>/work</code> — Работать (монеты)\n"
+        "🎁 <code>/bonus</code> — Ежедневный бонус\n"
+        "👤 <code>/profile</code> — Твой профиль\n"
+        "✏️ <code>/name [имя]</code> — Сменить ник\n"
+        "🏆 <code>/top</code> — Топ игроков\n"
+        "🎰 <code>/casino [сумма]</code> — Казино\n"
+        "⚔️ <code>/duel [сумма]</code> — Дуэль с игроком\n"
+        "💸 <code>/transfer [сумма]</code> — Перевод (ответом)\n"
+        "📈 <code>/rate</code> — Курс Чайханокойна\n"
+        "💰 <code>/buy [кол-во]</code> — Купить коины\n"
+        "📉 <code>/sell [кол-во]</code> — Продать коины\n"
+        "🐒 <code>/monkey</code> | 🐷 <code>/pig</code> — Питомцы\n"
+        "🎫 <code>/promo [код]</code> — Ввести промокод"
+        f"{AD_TEXT}"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("chaihana", "чайхана"))
+@dp.message(F.text.lower() == "чайхана")
 async def cmd_chaihana(message: types.Message):
     user = await get_user(message.from_user.id, message.from_user.username)
     now = int(time.time())
-    cooldown = 5400 # 1 час 30 минут
+    cooldown = 3600  # 1 час
 
-    if now - user[7] < cooldown:
-        wait_time = int(cooldown - (now - user[7]))
+    if now - user['last_chaihana'] < cooldown:
+        wait_time = int(cooldown - (now - user['last_chaihana']))
         m, s = divmod(wait_time, 60)
-        h, m = divmod(m, 60)
-        await message.answer(f"⏳ <b>Остынь!</b> Чайхана закрыта на уборку. Приходи через: {h}ч {m}м {s}с" + AD_TEXT, parse_mode="HTML")
+        await message.answer(f"⏳ <b>Чай еще горячий!</b>\nПриходи через: {m} мин. {s} сек." + AD_TEXT, parse_mode="HTML")
         return
 
-    points = random.randint(-10, 10)
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET points = points + ?, last_chaihana = ? WHERE user_id = ?", (points, now, message.from_user.id))
-        await db.commit()
+    points = random.randint(-20, 40)
+    await db.execute("UPDATE users SET points = points + ?, last_chaihana = ? WHERE user_id = ?", (points, now, message.from_user.id))
     
     emoji = "🟢" if points > 0 else "🔴"
-    await message.answer(f"{emoji} <b>Чайхана вердикт:</b>\nТы получил <b>{points}</b> очков преданности!" + AD_TEXT, parse_mode="HTML")
+    action = "кайфанул" if points > 0 else "обжегся"
+    await message.answer(f"{emoji} <b>Чайхана:</b> Ты {action} и получил <b>{points}</b> очков репутации!" + AD_TEXT, parse_mode="HTML")
 
-# /profile
-@dp.message(F.text.lower().in_({"профиль", "/profile", "profile"}))
+@dp.message(Command("work", "работа"))
+async def cmd_work(message: types.Message):
+    user = await get_user(message.from_user.id)
+    now = int(time.time())
+    cooldown = 1800 # 30 минут
+
+    if now - user['last_work'] < cooldown:
+        wait = int(cooldown - (now - user['last_work']))
+        m, s = divmod(wait, 60)
+        await message.answer(f"🛠 <b>Перекур!</b> Работать можно через: {m} мин.", parse_mode="HTML")
+        return
+
+    earnings = random.randint(5, 50)
+    await db.execute("UPDATE users SET coins = coins + ?, last_work = ? WHERE user_id = ?", (earnings, now, message.from_user.id))
+    await message.answer(f"🔨 Ты поработал на стройке чайханы и заработал <b>{earnings}</b> 🪙 чайханокойнов!{AD_TEXT}", parse_mode="HTML")
+
+@dp.message(Command("bonus", "бонус"))
+async def cmd_bonus(message: types.Message):
+    user = await get_user(message.from_user.id)
+    now = int(time.time())
+    cooldown = 86400 # 24 часа
+
+    if now - user['last_bonus'] < cooldown:
+        h = int((cooldown - (now - user['last_bonus'])) / 3600)
+        await message.answer(f"🎁 Бонус уже получен. Жди {h} ч.", parse_mode="HTML")
+        return
+
+    bonus_points = random.randint(100, 500)
+    bonus_coins = random.randint(10, 50)
+    
+    await db.execute("UPDATE users SET points = points + ?, coins = coins + ?, last_bonus = ? WHERE user_id = ?", 
+                     (bonus_points, bonus_coins, now, message.from_user.id))
+    
+    await message.answer(f"📅 <b>Ежедневный бонус:</b>\n+{bonus_points} очков\n+{bonus_coins} 🪙 коинов{AD_TEXT}", parse_mode="HTML")
+
+@dp.message(Command("profile", "профиль"))
 async def cmd_profile(message: types.Message):
     user = await get_user(message.from_user.id, message.from_user.username)
     rank = await get_rank(message.from_user.id)
-    name = user[2] if user[2] else (user[1] if user[1] else "Безымянный")
+    name = user['custom_name'] if user['custom_name'] else (user['username'] or "Гость")
     
+    # Расчет состояния
+    total_net_worth = user['points'] + (user['coins'] * CRYPTO_PRICE)
+
     text = (
-        f"👤 <b>Профиль пользователя:</b>\n"
+        f"👤 <b>Профиль Чайханщика:</b>\n"
         f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-        f"🏷 <b>Ник:</b> {name}\n"
-        f"🆔 <b>ID:</b> <code>{user[0]}</code>\n"
-        f"🏆 <b>Очки:</b> {user[3]}\n"
-        f"🪙 <b>Чайханокойны:</b> {user[4]}\n"
-        f"🌍 <b>Место в мире:</b> #{rank}\n"
-        f"🐒 <b>Бибизян:</b> {user[5]} ур.\n"
-        f"🐷 <b>Свин:</b> {user[6]} ур."
+        f"🏷 <b>Имя:</b> {name}\n"
+        f"🆔 <b>ID:</b> <code>{user['user_id']}</code>\n"
+        f"🏆 <b>Репутация:</b> {format_number(user['points'])}\n"
+        f"🪙 <b>Коины:</b> {format_number(user['coins'])}\n"
+        f"💰 <b>Состояние:</b> ≈ {format_number(total_net_worth)} очков\n"
+        f"🌍 <b>Ранг:</b> #{rank}\n\n"
+        f"🐒 <b>Бибизян:</b> {user['monkey_lvl']} ур.\n"
+        f"🐷 <b>Свин:</b> {user['pig_lvl']} ур."
         f"{AD_TEXT}"
     )
     
-    # Пытаемся получить аватарку
     photos = await message.from_user.get_profile_photos(limit=1)
     if photos.total_count > 0:
         await message.answer_photo(photos.photos[0][-1].file_id, caption=text, parse_mode="HTML")
     else:
         await message.answer(text, parse_mode="HTML")
 
-# /name
-@dp.message(Command("name"))
+@dp.message(Command("name", "ник"))
 async def cmd_name(message: types.Message, command: CommandObject):
     if not command.args:
-        await message.answer(f"❌ <b>Использование:</b> /name [Новое имя]{AD_TEXT}", parse_mode="HTML")
+        await message.answer(f"❌ <b>Пример:</b> /name [Новое имя]", parse_mode="HTML")
         return
     
-    new_name = command.args[:30] # Ограничение длины
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET custom_name = ? WHERE user_id = ?", (new_name, message.from_user.id))
-        await db.commit()
-    await message.answer(f"✅ Имя изменено на: <b>{new_name}</b>{AD_TEXT}", parse_mode="HTML")
+    new_name = command.args[:25].replace("<", "").replace(">", "") # Защита от HTML тегов
+    await db.execute("UPDATE users SET custom_name = ? WHERE user_id = ?", (new_name, message.from_user.id))
+    await message.answer(f"✅ Теперь тебя зовут: <b>{new_name}</b>{AD_TEXT}", parse_mode="HTML")
 
-# /rate (Курс)
-@dp.message(F.text.lower().in_({"курс", "/rate"}))
+# 💸 ЭКОНОМИКА
+# ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+@dp.message(Command("rate", "курс"))
 async def cmd_rate(message: types.Message):
-    await message.answer(f"📈 <b>Биржа Чайханы:</b>\n\n💰 1 Чайханокойн = <b>{CRYPTO_PRICE}</b> очков.\n<i>Курс обновляется каждые 1.3 минуты.</i>{AD_TEXT}", parse_mode="HTML")
+    await message.answer(f"📈 <b>Биржа Чайханы:</b>\n\n💰 1 🪙 = <b>{CRYPTO_PRICE}</b> очков репутации.\n<i>Курс плавающий!</i>{AD_TEXT}", parse_mode="HTML")
 
-# /buy (Купить)
-@dp.message(F.text.lower().startswith(("купить", "/buy")))
-async def cmd_buy(message: types.Message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer(f"❌ Пиши: <code>купить [сумма]</code> или <code>купить все</code>{AD_TEXT}", parse_mode="HTML")
+@dp.message(Command("buy", "купить"))
+async def cmd_buy(message: types.Message, command: CommandObject):
+    if not command.args:
+        await message.answer(f"❌ Используй: <code>/buy [сумма]</code> или <code>/buy все</code>", parse_mode="HTML")
         return
     
     user = await get_user(message.from_user.id)
-    amount_req = args[1].lower()
+    arg = command.args.lower()
     
-    max_buy = user[3] // CRYPTO_PRICE # Сколько может купить на свои очки
+    can_buy_max = user['points'] // CRYPTO_PRICE
     
-    if amount_req == "все" or amount_req == "all":
-        count = max_buy
+    if arg in ["все", "all", "всё"]:
+        count = can_buy_max
     else:
         try:
-            count = int(amount_req)
-        except:
-            await message.answer("❌ Неверное число.")
+            count = int(arg)
+        except ValueError:
+            await message.answer("❌ Введи число.")
             return
 
     if count <= 0:
-        await message.answer("❌ Минимум 1 монета.")
+        await message.answer("❌ Нельзя купить 0 или меньше.")
         return
 
     cost = count * CRYPTO_PRICE
-    if user[3] < cost:
-        await message.answer(f"❌ Недостаточно очков. Нужно: {cost}, есть: {user[3]}{AD_TEXT}", parse_mode="HTML")
+    if user['points'] < cost:
+        await message.answer(f"❌ Не хватает очков. Твой баланс: {user['points']}. Нужно: {cost}")
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET points = points - ?, coins = coins + ? WHERE user_id = ?", (cost, count, message.from_user.id))
-        await db.commit()
-    
+    await db.execute("UPDATE users SET points = points - ?, coins = coins + ? WHERE user_id = ?", (cost, count, message.from_user.id))
     await message.answer(f"✅ Куплено <b>{count}</b> 🪙 за <b>{cost}</b> очков.{AD_TEXT}", parse_mode="HTML")
 
-# /sell (Продать)
-@dp.message(F.text.lower().startswith(("продать", "/sell")))
-async def cmd_sell(message: types.Message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer(f"❌ Пиши: <code>продать [сумма]</code> или <code>продать все</code>{AD_TEXT}", parse_mode="HTML")
+@dp.message(Command("sell", "продать"))
+async def cmd_sell(message: types.Message, command: CommandObject):
+    if not command.args:
+        await message.answer(f"❌ Используй: <code>/sell [сумма]</code> или <code>/sell все</code>", parse_mode="HTML")
         return
     
     user = await get_user(message.from_user.id)
-    amount_req = args[1].lower()
+    arg = command.args.lower()
     
-    if amount_req == "все" or amount_req == "all":
-        count = user[4]
+    if arg in ["все", "all", "всё"]:
+        count = user['coins']
     else:
         try:
-            count = int(amount_req)
-        except:
-            await message.answer("❌ Неверное число.")
-            return
+            count = int(arg)
+        except ValueError: return
 
-    if count <= 0 or user[4] < count:
-        await message.answer(f"❌ У тебя нет столько монет.{AD_TEXT}", parse_mode="HTML")
+    if count <= 0 or user['coins'] < count:
+        await message.answer(f"❌ У тебя нет столько монет.")
         return
 
     profit = count * CRYPTO_PRICE
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET coins = coins - ?, points = points + ? WHERE user_id = ?", (count, profit, message.from_user.id))
-        await db.commit()
-    
+    await db.execute("UPDATE users SET coins = coins - ?, points = points + ? WHERE user_id = ?", (count, profit, message.from_user.id))
     await message.answer(f"✅ Продано <b>{count}</b> 🪙 за <b>{profit}</b> очков.{AD_TEXT}", parse_mode="HTML")
 
-# /transfer (Передать)
-@dp.message(F.text.lower().startswith(("передать", "/transfer")))
-async def cmd_transfer(message: types.Message):
+@dp.message(Command("transfer", "передать"))
+async def cmd_transfer(message: types.Message, command: CommandObject):
     if not message.reply_to_message:
-        await message.answer(f"❌ Эту команду нужно писать в ответ на сообщение того, кому передаешь.{AD_TEXT}", parse_mode="HTML")
+        await message.answer("❌ Эту команду нужно писать в ответ на сообщение получателя.")
         return
-
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("❌ Укажи сумму: <code>передать 100</code>")
+    
+    if message.reply_to_message.from_user.is_bot or message.reply_to_message.from_user.id == message.from_user.id:
+        await message.answer("❌ Нельзя переводить ботам или самому себе.")
         return
 
     try:
-        amount = int(args[1])
-    except:
+        amount = int(command.args)
+    except (ValueError, TypeError):
+        await message.answer("❌ Укажи сумму: <code>/transfer 100</code>", parse_mode="HTML")
         return
 
     if amount <= 0: return
+
     sender = await get_user(message.from_user.id)
+    if sender['points'] < amount:
+        await message.answer("❌ Недостаточно средств.")
+        return
+
     receiver_id = message.reply_to_message.from_user.id
+    # Создаем получателя если его нет
+    await get_user(receiver_id, message.reply_to_message.from_user.username)
 
-    if sender[3] < amount:
-        await message.answer(f"❌ Недостаточно средств.{AD_TEXT}", parse_mode="HTML")
-        return
+    await db.execute("UPDATE users SET points = points - ? WHERE user_id = ?", (amount, message.from_user.id))
+    await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amount, receiver_id))
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET points = points - ? WHERE user_id = ?", (amount, message.from_user.id))
-        await db.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (receiver_id, message.reply_to_message.from_user.username))
-        await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amount, receiver_id))
-        await db.commit()
+    await message.answer(f"💸 <b>Перевод успешен!</b>\nОтправлено {amount} очков игроку {message.reply_to_message.from_user.first_name}.{AD_TEXT}", parse_mode="HTML")
 
-    await message.answer(f"💸 <b>Перевод успешен!</b>\n{message.from_user.first_name} перевел {amount} очков пользователю {message.reply_to_message.from_user.first_name}{AD_TEXT}", parse_mode="HTML")
-
-# /casino (Казино)
-@dp.message(F.text.lower().startswith(("казино", "/casino")))
-async def cmd_casino(message: types.Message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer(f"🎰 Ставка: <code>казино [сумма]</code>{AD_TEXT}", parse_mode="HTML")
-        return
+# 🎰 ИГРЫ
+# ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+@dp.message(Command("casino", "казино"))
+async def cmd_casino(message: types.Message, command: CommandObject):
     try:
-        bet = int(args[1])
-    except: return
+        bet = int(command.args)
+    except (ValueError, TypeError):
+        await message.answer("🎰 Ставка: <code>/casino [сумма]</code>", parse_mode="HTML")
+        return
 
-    if bet <= 0: return
+    if bet < 10:
+        await message.answer("❌ Минимальная ставка 10 очков.")
+        return
+
     user = await get_user(message.from_user.id)
-    if user[3] < bet:
-        await message.answer(f"❌ Мало очков для ставки.{AD_TEXT}", parse_mode="HTML")
+    if user['points'] < bet:
+        await message.answer("❌ Не хватает очков.")
         return
 
-    # Списываем ставку
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET points = points - ? WHERE user_id = ?", (bet, message.from_user.id))
-        await db.commit()
-
-    # Кидаем дайс
+    await db.execute("UPDATE users SET points = points - ? WHERE user_id = ?", (bet, message.from_user.id))
+    
     msg = await message.answer_dice(emoji="🎰")
+    await asyncio.sleep(2.5) # Ждем анимацию
     val = msg.dice.value
-    await asyncio.sleep(2) # Пауза для анимации
 
-    # Логика слота (Telegram dice value: 1-64. 64 is 777)
-    # Упрощенная логика по значениям дайса:
-    # 1, 22, 43 - это бары, виноград, лимоны (проигрыш/малый выигрыш - зависит от реализации)
-    # Но в ТГ value 64 = три семерки.
-    
-    # Сделаем простую логику:
+    # Коэффициенты: 64 (три семерки) = x10, 1,22,43 (фрукты в ряд) = x3
     win_coeff = 0
-    if val == 64: # 777
-        win_coeff = 5
-    elif val in [1, 22, 43]: # Три одинаковых картинки (условно)
-        win_coeff = 2
-    
-    if win_coeff > 0:
-        win_amount = bet * win_coeff
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (win_amount, message.from_user.id))
-            await db.commit()
-        await message.answer(f"🎉 <b>ДЖЕКПОТ!</b> Выпало x{win_coeff}! Ты выиграл <b>{win_amount}</b> очков!{AD_TEXT}", parse_mode="HTML")
-    else:
-        await message.answer(f"📉 Ты проиграл <b>{bet}</b> очков. Попробуй еще!{AD_TEXT}", parse_mode="HTML")
+    if val == 64: win_coeff = 10
+    elif val in [1, 22, 43]: win_coeff = 3
+    elif val in [16, 32, 48]: win_coeff = 1.5 # Две похожие
 
-# /duel (Дуэль)
-@dp.message(F.text.lower().startswith(("дуэль", "/duel")))
-async def cmd_duel(message: types.Message):
-    if not message.reply_to_message or message.reply_to_message.from_user.is_bot:
-        await message.answer(f"⚔️ Ответь на сообщение соперника: <code>дуэль [сумма]</code>{AD_TEXT}", parse_mode="HTML")
+    if win_coeff > 0:
+        win_amount = int(bet * win_coeff)
+        await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (win_amount, message.from_user.id))
+        await message.answer(f"🎉 <b>ПОБЕДА!</b> Коэффициент x{win_coeff}!\nВыигрыш: {win_amount} очков!{AD_TEXT}", parse_mode="HTML")
+    else:
+        await message.answer(f"📉 Не повезло. Ты потерял {bet} очков.{AD_TEXT}", parse_mode="HTML")
+
+@dp.message(Command("duel", "дуэль"))
+async def cmd_duel(message: types.Message, command: CommandObject):
+    if not message.reply_to_message or message.reply_to_message.from_user.is_bot or message.reply_to_message.from_user.id == message.from_user.id:
+        await message.answer("⚔️ Команду нужно писать в ответ реальному игроку.")
         return
     
-    args = message.text.split()
     try:
-        amount = int(args[1])
-    except: return
+        amount = int(command.args)
+    except (ValueError, TypeError):
+        await message.answer("⚔️ Укажи ставку: <code>/duel 100</code>", parse_mode="HTML")
+        return
+
+    if amount < 1: return
 
     user = await get_user(message.from_user.id)
     target = await get_user(message.reply_to_message.from_user.id)
-    
-    if user[3] < amount or target[3] < amount:
-        await message.answer("❌ У кого-то из вас не хватает очков!", parse_mode="HTML")
+
+    if user['points'] < amount:
+        await message.answer("❌ У тебя не хватает очков.")
+        return
+    if target['points'] < amount:
+        await message.answer("❌ У соперника не хватает очков.")
         return
 
-    # Клавиатура
+    # Callback data structure: duel:action:amount:challenger_id
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Принять", callback_data=f"duel_acc_{amount}_{message.from_user.id}")
-    kb.button(text="❌ Отказаться", callback_data=f"duel_dec_{message.from_user.id}")
-    kb.button(text="🚫 Отменить", callback_data=f"duel_cancel_{message.from_user.id}") # Может нажать автор
+    kb.button(text="✅ Принять", callback_data=f"duel:acc:{amount}:{message.from_user.id}")
+    kb.button(text="❌ Отказаться", callback_data=f"duel:dec:{amount}:{message.from_user.id}")
     
-    msg = await message.answer(
-        f"⚔️ <b>ДУЭЛЬ!</b>\n{message.from_user.first_name} вызывает {message.reply_to_message.from_user.first_name}!\n💰 Ставка: <b>{amount}</b>",
-        reply_markup=kb.as_markup(),
-        parse_mode="HTML"
+    await message.answer(
+        f"⚔️ <b>ВЫЗОВ НА ДУЭЛЬ!</b>\n{message.from_user.first_name} вызывает {message.reply_to_message.from_user.first_name}!\n💰 Ставка: <b>{amount}</b>",
+        reply_markup=kb.as_markup(), parse_mode="HTML"
     )
 
-@dp.callback_query(F.data.startswith("duel_"))
-async def duel_callback(callback: types.CallbackQuery):
-    data = callback.data.split("_")
-    action = data[1]
+@dp.callback_query(F.data.startswith("duel:"))
+async def duel_callback(callback: CallbackQuery):
+    _, action, s_amount, challenger_id_str = callback.data.split(":")
+    amount = int(s_amount)
+    challenger_id = int(challenger_id_str)
     
-    # Получаем ID участников из текста сообщения (хак, лучше хранить в БД, но для простоты так)
-    # В колбеке мы передали ID автора вызова (challenger)
-    challenger_id = int(data[-1])
-    
-    # Тот, кому бросили вызов - это юзер, упомянутый в тексте, но надежнее проверить права
-    # В данном коде мы упростим: кнопку принять может нажать только тот, на чье сообщение ответили.
-    # Но так как reply нет в callback, мы полагаемся на логику "только соперник может принять"
-    
-    # Определим соперника по entities сообщения или просто сделаем проверку:
-    # Принять может любой кроме автора? Нет, это дыра.
-    # Исправим: Дуэль через реплай, значит мы знаем имена.
-    
+    # Тот, кого вызывали (должен быть получателем сообщения с кнопками, но в чате любой может нажать, поэтому проверяем)
+    # В данном упрощенном варианте мы проверяем, не нажимает ли сам вызывающий
+    if callback.from_user.id == challenger_id:
+        if action == "dec": # Вызывающий может отменить
+             await callback.message.edit_text(f"🚫 Дуэль отменена.{AD_TEXT}", parse_mode="HTML")
+             return
+        await callback.answer("Жди ответа соперника!", show_alert=True)
+        return
+
+    if action == "dec":
+        await callback.message.edit_text(f"❌ Дуэль отклонена.{AD_TEXT}", parse_mode="HTML")
+        return
+
     if action == "acc":
-        amount = int(data[2])
-        # Проверка: нажать может кто угодно? Нет, надо ограничить.
-        # В идеале хранить state. Тут разрешим нажать "Принять" любому кроме автора (риск, но код проще)
-        if callback.from_user.id == challenger_id:
-            await callback.answer("Ты не можешь принять свой вызов!", show_alert=True)
+        # Повторная проверка баланса
+        challenger = await get_user(challenger_id)
+        acceptor = await get_user(callback.from_user.id)
+        
+        if challenger['points'] < amount or acceptor['points'] < amount:
+            await callback.message.edit_text("❌ У кого-то закончились деньги во время раздумий.")
             return
-            
-        # Проводим дуэль
-        # Бросок 1
+
+        await callback.message.edit_text(f"🎲 <b>Бросаем кубики...</b>\nИгроки: {challenger['custom_name'] or 'Игрок 1'} vs {acceptor['custom_name'] or 'Игрок 2'}", parse_mode="HTML")
+        
         d1 = await callback.message.answer_dice(emoji="🎲")
-        # Бросок 2
         d2 = await callback.message.answer_dice(emoji="🎲")
         await asyncio.sleep(4)
         
-        v1 = d1.dice.value # Challenger (автор)
-        v2 = d2.dice.value # Opponent (нажавший)
-        
-        # Списываем/начисляем
-        async with aiosqlite.connect(DB_NAME) as db:
-            if v1 > v2:
-                winner = challenger_id
-                loser = callback.from_user.id
-                res = f"🏆 Победил вызывавший (ID {winner})!"
-            elif v2 > v1:
-                winner = callback.from_user.id
-                loser = challenger_id
-                res = f"🏆 Победил принявший (ID {winner})!"
-            else:
-                await callback.message.edit_text(f"🤝 <b>Ничья!</b> Ставки возвращены.{AD_TEXT}", parse_mode="HTML")
-                return
+        v1 = d1.dice.value # Вызывающий
+        v2 = d2.dice.value # Принявший
 
-            await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amount, winner))
-            await db.execute("UPDATE users SET points = points - ? WHERE user_id = ?", (amount, loser))
-            await db.commit()
-            
-        await callback.message.edit_text(f"⚔️ <b>Результат:</b> {v1} vs {v2}\n{res}\n💰 Выигрыш: {amount}{AD_TEXT}", parse_mode="HTML")
+        winner_id = None
+        loser_id = None
+        res_text = ""
 
-    elif action == "dec":
-        if callback.from_user.id == challenger_id:
-            await callback.answer("Ты не можешь отказаться от своего вызова, жми Отменить.", show_alert=True)
+        if v1 > v2:
+            winner_id, loser_id = challenger_id, callback.from_user.id
+            res_text = f"🏆 Победил вызывавший!"
+        elif v2 > v1:
+            winner_id, loser_id = callback.from_user.id, challenger_id
+            res_text = f"🏆 Победил принявший!"
+        else:
+            await callback.message.answer(f"🤝 <b>Ничья!</b> Ставки возвращены.{AD_TEXT}", parse_mode="HTML")
             return
-        await callback.message.edit_text(f"❌ Дуэль отклонена.{AD_TEXT}", parse_mode="HTML")
-        
-    elif action == "cancel":
-        if callback.from_user.id != challenger_id:
-            await callback.answer("Только автор может отменить.", show_alert=True)
-            return
-        await callback.message.delete()
 
-# /monkey & /pig (Питомцы)
-@dp.message(F.text.lower().in_({"бибизян", "/monkey", "свин", "/pig"}))
-async def cmd_pet(message: types.Message):
-    cmd = message.text.lower().replace("/", "")
+        await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amount, winner_id))
+        await db.execute("UPDATE users SET points = points - ? WHERE user_id = ?", (amount, loser_id))
+        
+        await callback.message.answer(f"⚔️ Результат:\n{v1} : {v2}\n\n{res_text}\n💰 Выигрыш: {amount} очков.{AD_TEXT}", parse_mode="HTML")
+
+# 🐾 ПИТОМЦЫ
+# ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+@dp.message(Command("monkey", "бибизян"))
+async def cmd_monkey(message: types.Message):
+    await pet_menu(message, "mon")
+
+@dp.message(Command("pig", "свин"))
+async def cmd_pig(message: types.Message):
+    await pet_menu(message, "pig")
+
+async def pet_menu(message, p_type):
     user = await get_user(message.from_user.id)
-    is_monkey = "бибизян" in cmd or "monkey" in cmd
+    is_mon = p_type == "mon"
+    lvl = user['monkey_lvl'] if is_mon else user['pig_lvl']
+    name = "🐒 Бибизян" if is_mon else "🐷 Свин"
     
-    # Индексы в БД: 5 - monkey_lvl, 6 - pig_lvl
-    lvl_idx = 5 if is_monkey else 6
-    lvl = user[lvl_idx]
-    pet_name = "🐒 Бибизян" if is_monkey else "🐷 Свин"
-    cost_base = 5000 if is_monkey else 3500
+    # Экономика питомцев
+    base_income = 15 if is_mon else 150
+    income = lvl * base_income
+    currency = "🪙" if is_mon else "очков"
     
-    # Цена улучшения: База * (Лвл + 1)
-    upgrade_cost = cost_base * (lvl + 1)
+    base_cost = 5000 if is_mon else 3500
+    upg_cost = base_cost * (lvl + 1)
     
     kb = InlineKeyboardBuilder()
-    if lvl < 15:
-        kb.button(text=f"⬆️ Улучшить ({upgrade_cost})", callback_data=f"upg_{'mon' if is_monkey else 'pig'}_{upgrade_cost}")
-    kb.button(text="🚜 Фармить", callback_data=f"farm_{'mon' if is_monkey else 'pig'}")
+    if lvl < 20: 
+        kb.button(text=f"⬆️ Улучшить ({upg_cost} pts)", callback_data=f"pet:upg:{p_type}")
     
-    text = (
-        f"{pet_name} (Уровень {lvl}/15)\n"
-        f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-        f"Добывает: {'🪙 Крипту' if is_monkey else '🏆 Очки'}\n"
-        f"Доход: {lvl * (10 if is_monkey else 100)} за сбор.\n"
-        f"КД сбора: 1 час.\n"
-        f"Стоимость улучшения: {upgrade_cost}\n"
-    )
-    if lvl == 0:
-        text += "\n<i>Купи питомца, нажав 'Улучшить'!</i>"
-        
+    kb.button(text="🚜 Фармить", callback_data=f"pet:farm:{p_type}")
+    
+    text = (f"<b>{name}</b> (Уровень {lvl})\n"
+            f"💰 Доход: {income} {currency} / час\n"
+            f"⚡️ Цена улучшения: {upg_cost} очков\n\n"
+            f"<i>Для фарма нажми кнопку ниже.</i>")
+    
+    if lvl == 0: text += "\n\n⚠️ <b>У тебя нет питомца!</b> Улучши уровень, чтобы купить."
+    
     await message.answer(text + AD_TEXT, reply_markup=kb.as_markup(), parse_mode="HTML")
 
-@dp.callback_query(F.data.startswith(("upg_", "farm_")))
-async def pet_callback(callback: types.CallbackQuery):
-    action, pet_type, *args = callback.data.split("_")
+@dp.callback_query(F.data.startswith("pet:"))
+async def pet_callback(callback: CallbackQuery):
+    _, action, ptype = callback.data.split(":")
     user_id = callback.from_user.id
     user = await get_user(user_id)
+    is_mon = ptype == "mon"
     
-    is_monkey = pet_type == "mon"
-    lvl_idx = 5 if is_monkey else 6
-    lvl = user[lvl_idx]
-    
+    lvl_col = "monkey_lvl" if is_mon else "pig_lvl"
+    lvl = user[lvl_col]
+
     if action == "upg":
-        cost = int(args[0])
-        if lvl >= 15:
-            await callback.answer("Максимальный уровень!", show_alert=True)
-            return
-        if user[3] < cost: # Покупаем за очки
-            await callback.answer("Не хватает очков!", show_alert=True)
+        base_cost = 5000 if is_mon else 3500
+        cost = base_cost * (lvl + 1)
+        
+        if user['points'] < cost:
+            await callback.answer("❌ Не хватает очков!", show_alert=True)
             return
         
-        async with aiosqlite.connect(DB_NAME) as db:
-            col = "monkey_lvl" if is_monkey else "pig_lvl"
-            await db.execute(f"UPDATE users SET points = points - ?, {col} = {col} + 1 WHERE user_id = ?", (cost, user_id))
-            await db.commit()
-        await callback.message.edit_text(f"✅ Питомец улучшен до {lvl+1} уровня!{AD_TEXT}", parse_mode="HTML")
-        
+        await db.execute(f"UPDATE users SET points = points - ?, {lvl_col} = {lvl_col} + 1 WHERE user_id = ?", (cost, user_id))
+        await callback.answer(f"Уровень повышен до {lvl+1}!", show_alert=True)
+        await callback.message.delete() # Удаляем старое меню чтобы не путать
+
     elif action == "farm":
         if lvl == 0:
-            await callback.answer("Сначала купи питомца!", show_alert=True)
+            await callback.answer("Сначала купи питомца (кнопка Улучшить)", show_alert=True)
             return
             
-        last_farm_idx = 8 if is_monkey else 9
-        last_farm = user[last_farm_idx]
+        last_col = "last_farm_monkey" if is_mon else "last_farm_pig"
+        last_time = user[last_col]
         now = int(time.time())
         
-        if now - last_farm < 3600:
-            await callback.answer(f"⏳ Питомец устал. Жди еще {(3600 - (now-last_farm))//60} мин.", show_alert=True)
+        if now - last_time < 3600:
+            rem = 3600 - (now - last_time)
+            m = rem // 60
+            await callback.answer(f"⏳ Питомец устал. Жди {m} мин.", show_alert=True)
             return
             
-        farm_amount = lvl * (10 if is_monkey else 100) # Формула дохода
-        res_col = "coins" if is_monkey else "points"
-        last_farm_col = "last_farm_monkey" if is_monkey else "last_farm_pig"
+        income = lvl * (15 if is_mon else 150)
+        curr_col = "coins" if is_mon else "points"
         
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute(f"UPDATE users SET {res_col} = {res_col} + ?, {last_farm_col} = ? WHERE user_id = ?", (farm_amount, now, user_id))
-            await db.commit()
-            
-        currency = "🪙" if is_monkey else "🏆"
-        await callback.answer(f"Собрано {farm_amount} {currency}", show_alert=True)
+        await db.execute(f"UPDATE users SET {curr_col} = {curr_col} + ?, {last_col} = ? WHERE user_id = ?", (income, now, user_id))
+        currency = "коинов" if is_mon else "очков"
+        await callback.answer(f"✅ Собрано {income} {currency}!", show_alert=True)
 
-# 👑 АДМИН ПАНЕЛЬ
+# 📊 РАЗНОЕ
 # ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
-@dp.message(Command("adminhelp"))
-async def cmd_admin_help(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    text = (
-        "🔐 <b>Админ-панель:</b>\n"
-        "/set [id/reply] [сумма] - Установить очки\n"
-        "/addpromo [код] [мин] [макс] - Создать промокод (перезаписывает)\n"
-        "/send [текст] - Рассылка всем\n"
-    )
+@dp.message(Command("top", "top"))
+async def cmd_top(message: types.Message):
+    # Топ 10 по очкам
+    users = await db.execute("SELECT * FROM users ORDER BY points DESC LIMIT 10", fetch="all")
+    text = "🏆 <b>Топ 10 Олигархов:</b>\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+    for i, u in enumerate(users, 1):
+        n = u['custom_name'] or u['username'] or "Аноним"
+        text += f"{i}. <b>{n}</b> — {format_number(u['points'])}\n"
+    
     await message.answer(text + AD_TEXT, parse_mode="HTML")
 
-@dp.message(Command("set"))
-async def cmd_set(message: types.Message, command: CommandObject):
-    if message.from_user.id != ADMIN_ID: return
-    args = command.args.split() if command.args else []
+@dp.message(Command("promo", "промо"))
+async def cmd_promo(message: types.Message, command: CommandObject):
+    if not command.args:
+        await message.answer("🎫 Введи код: <code>/promo [код]</code>", parse_mode="HTML")
+        return
     
-    target_id = message.from_user.id
-    amount = 0
+    code = command.args.strip()
+    promo = await db.execute("SELECT * FROM promos WHERE code = ?", (code,), fetch="one")
     
-    if message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
-        if args: amount = int(args[0])
-    elif len(args) >= 2:
-        target_id = int(args[0])
-        amount = int(args[1])
-    else:
-        await message.answer("Ошибка аргументов.")
+    if not promo:
+        await message.answer("❌ Такого промокода нет.")
+        return
+        
+    used = await db.execute("SELECT * FROM used_promos WHERE user_id = ? AND code = ?", (message.from_user.id, code), fetch="one")
+    if used:
+        await message.answer("❌ Ты уже активировал этот код.")
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET points = ? WHERE user_id = ?", (amount, target_id))
-        await db.commit()
-    await message.answer(f"✅ Установлено {amount} очков для {target_id}")
+    reward = random.randint(promo['min_val'], promo['max_val'])
+    
+    await db.execute("INSERT INTO used_promos VALUES (?, ?)", (message.from_user.id, code))
+    await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (reward, message.from_user.id))
+    await db.execute("UPDATE promos SET activations = activations + 1 WHERE code = ?", (code,))
+    
+    await message.answer(f"✅ <b>Промокод активирован!</b>\nНачислено: +{reward} очков.{AD_TEXT}", parse_mode="HTML")
 
+# 👑 АДМИНКА
+# ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 @dp.message(Command("addpromo"))
-async def cmd_addpromo(message: types.Message, command: CommandObject):
+async def adm_addpromo(message: types.Message, command: CommandObject):
     if message.from_user.id != ADMIN_ID: return
-    # /addpromo NEWYEAR -100 100
     try:
-        args = command.args.split()
+        args = command.args.split() # code min max
         code = args[0]
         min_v = int(args[1])
         max_v = int(args[2])
+        await db.execute("INSERT OR REPLACE INTO promos (code, min_val, max_val) VALUES (?, ?, ?)", (code, min_v, max_v))
+        await message.answer(f"Admin: Promo {code} added ({min_v}-{max_v}).")
     except:
-        await message.answer("Формат: /addpromo CODE MIN MAX")
-        return
+        await message.answer("Error. Use: /addpromo code min max")
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO promos (code, min_val, max_val, is_random) VALUES (?, ?, ?, 1)", (code, min_v, max_v))
-        await db.commit()
-    await message.answer(f"📢 Промокод <b>{code}</b> создан ({min_v} - {max_v}).", parse_mode="HTML")
+@dp.message(Command("admgive"))
+async def adm_give(message: types.Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        args = command.args.split() # id amount
+        uid = int(args[0])
+        amt = int(args[1])
+        await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (amt, uid))
+        await message.answer(f"Admin: Gave {amt} to {uid}")
+    except:
+        await message.answer("Error.")
 
-@dp.message(F.text) # Обработка промокода просто текстом
-async def check_promo(message: types.Message):
-    # Если это не команда, проверяем на промокод
-    if message.text.startswith("/"): return 
-    
-    code = message.text.strip()
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Проверка существования
-        async with db.execute("SELECT * FROM promos WHERE code = ?", (code,)) as cursor:
-            promo = await cursor.fetchone()
-        
-        if not promo: return # Не промокод, игнорим
-        
-        # Проверка использования
-        async with db.execute("SELECT * FROM used_promos WHERE user_id = ? AND code = ?", (message.from_user.id, code)) as cursor:
-            if await cursor.fetchone():
-                await message.answer(f"❌ Ты уже активировал этот код!{AD_TEXT}", parse_mode="HTML")
-                return
-
-        # Награда
-        reward = random.randint(promo[1], promo[2])
-        await db.execute("INSERT INTO used_promos (user_id, code) VALUES (?, ?)", (message.from_user.id, code))
-        await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (reward, message.from_user.id))
-        await db.commit()
-        
-        await message.answer(f"🎁 <b>Промокод активирован!</b>\nТы получил: <b>{reward}</b> очков!{AD_TEXT}", parse_mode="HTML")
-
-# /top & /world
-@dp.message(F.text.lower().in_({"топ", "/top", "мир", "/world"}))
-async def cmd_top(message: types.Message):
-    is_world = "мир" in message.text.lower() or "world" in message.text.lower()
-    
-    chat_users = []
-    if not is_world and message.chat.type != "private":
-        # Это сложный момент для ботов: получить всех юзеров чата невозможно без админки и кэша.
-        # Для "Топ чата" мы покажем топ мира, но с заголовком, либо (если бы была база всех участников чата) фильтровали бы.
-        # В данном решении, чтобы код работал 100%, топ чата будет работать как Топ мира, 
-        # но в реальном проекте нужно сохранять chat_id в таблицу users при каждом сообщении.
-        pass
-
-    users = await get_top_users(10, global_top=True) # Пока используем глобальный топ для надежности
-    
-    title = "🌍 Топ мира" if is_world else "🏆 Топ (глобальный)"
-    text = f"<b>{title}:</b>\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-    
-    for idx, u in enumerate(users, 1):
-        name = u[1] if u[1] else (u[2] if u[2] else "ID: " + str(u[0]))
-        medal = "🥇" if idx==1 else ("🥈" if idx==2 else ("🥉" if idx==3 else f"{idx}."))
-        text += f"{medal} <b>{name}</b> — {u[3]}\n"
-        
-    await message.answer(text + AD_TEXT, parse_mode="HTML")
-
-# /help
-@dp.message(Command("start"))
-@dp.message(F.text.lower().in_({"помощь", "/help"}))
-async def cmd_help(message: types.Message):
-    await get_user(message.from_user.id, message.from_user.username) # Регаем если нет
-    text = (
-        "🤖 <b>Чайхана Бот v1.0</b>\n"
-        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-        "☕ <code>/chaihana</code> - Получить очки (-10..10)\n"
-        "👤 <code>/profile</code> - Твой профиль\n"
-        "✏️ <code>/name [имя]</code> - Сменить ник\n"
-        "🏆 <code>/top</code> / <code>/world</code> - Рейтинги\n"
-        "🎰 <code>/casino [сумма]</code> - Испытай удачу (777 = x5)\n"
-        "⚔️ <code>/duel [сумма]</code> - Вызвать на бой (реплай)\n"
-        "💸 <code>/transfer [сумма]</code> - Передать очки (реплай)\n"
-        "📈 <code>/rate</code> - Курс Чайханокойна\n"
-        "💰 <code>/buy</code> / <code>/sell</code> - Торговля криптой\n"
-        "🐒 <code>/monkey</code> - Майнер крипты\n"
-        "🐷 <code>/pig</code> - Майнер очков\n"
-        f"{AD_TEXT}"
-    )
-    await message.answer(text, parse_mode="HTML")
-
+# 🚀 ЗАПУСК
+# ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 async def main():
-    await init_db()
-    
-    # Настройка команд меню
-    commands = [
-        types.BotCommand(command="chaihana", description="Получить очки"),
-        types.BotCommand(command="profile", description="Профиль"),
-        types.BotCommand(command="top", description="Топ игроков"),
-        types.BotCommand(command="help", description="Помощь"),
-    ]
-    await bot.set_my_commands(commands)
+    await db.init_tables()
     
     # Запуск фоновых задач
     asyncio.create_task(crypto_updater())
     
-    print("🚀 БОТ ЗАПУЩЕН! Чайхана открыта.")
+    # Удаление вебхука и запуск пуллинга
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("🚀 BOT STARTED SUCCESSFULLY!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Бот выключен.")
+        print("Bot stopped.")
